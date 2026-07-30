@@ -1,0 +1,174 @@
+name: build-geosite
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'   # every 6 hours, offset minute to avoid peak load
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if the upstream lists have not changed
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-geosite
+  cancel-in-progress: false
+
+env:
+  CATEGORY: no-russia        # the only list name -> geosite:no-russia
+  DAT_NAME: no-russia.dat    # output file name
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch and normalize all upstream lists
+        run: |
+          set -euo pipefail
+          mkdir -p sources
+
+          while IFS=$'\t' read -r name url || [ -n "${name:-}" ]; do
+            [ -z "${name:-}" ] && continue
+            case "$name" in \#*) continue ;; esac
+
+            echo "::group::$name"
+            curl -fsSL --retry 5 --retry-delay 5 "$url" -o /tmp/raw
+
+            # The generator accepts only [a-z0-9.-] in domain values and aborts
+            # the whole build on the first invalid line, so filter strictly.
+            sed -e 's/\r$//' -e 's/#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' /tmp/raw \
+              | tr 'A-Z' 'a-z' \
+              | grep -E '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$' \
+              | sort -u > /tmp/clean
+
+            # Sanity check: reject an empty or suspiciously truncated source.
+            new=$(wc -l < /tmp/clean)
+            old=$( [ -f "sources/$name" ] && wc -l < "sources/$name" || echo 0 )
+            echo "$name: old=$old new=$new"
+            if [ "$new" -lt 10 ] || { [ "$old" -gt 0 ] && [ "$new" -lt $((old / 2)) ]; }; then
+              echo "::error::source '$name' looks broken ($new lines vs $old)"
+              exit 1
+            fi
+
+            mv /tmp/clean "sources/$name"
+            echo "::endgroup::"
+          done < sources.tsv
+
+      - name: Detect changes
+        id: check
+        run: |
+          if [ -n "$(git status --porcelain -- sources/)" ] || [ "${{ inputs.force }}" = "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream lists unchanged - nothing to build."
+          fi
+
+      - name: Merge sources into a single list
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # data/ holds exactly one file, so the dat gets exactly one category.
+          # Only sources listed in sources.tsv are merged, so a removed source
+          # cannot leak in from a stale file left over in the working tree.
+          rm -rf data
+          mkdir -p data
+          : > /tmp/merged
+
+          while IFS=$'\t' read -r name url || [ -n "${name:-}" ]; do
+            [ -z "${name:-}" ] && continue
+            case "$name" in \#*) continue ;; esac
+            cat "sources/$name" >> /tmp/merged
+          done < sources.tsv
+
+          # exact duplicates go here; redundant subdomains are dropped later
+          # by the generator's polishList()
+          sort -u /tmp/merged > "data/$CATEGORY"
+          echo "merged: $(wc -l < "data/$CATEGORY") unique lines"
+
+      - uses: actions/setup-go@v5
+        if: steps.check.outputs.changed == 'true'
+        with:
+          go-version: '1.24'   # main.go uses strings.SplitSeq (Go 1.24+)
+
+      - name: Build no-russia.dat
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/v2fly/domain-list-community.git /tmp/dlc
+          cd /tmp/dlc
+          go run ./ \
+            --datapath="$GITHUB_WORKSPACE/data" \
+            --outputdir="$GITHUB_WORKSPACE/dist" \
+            --outputname="$DAT_NAME" \
+            --exportlists="$CATEGORY"
+
+          cd "$GITHUB_WORKSPACE/dist"
+          sha256sum "$DAT_NAME" | tee "$DAT_NAME.sha256"
+
+      - name: Write build summary
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          {
+            echo "| source | domains |"
+            echo "|---|---|"
+            while IFS=$'\t' read -r name url || [ -n "${name:-}" ]; do
+              [ -z "${name:-}" ] && continue
+              case "$name" in \#*) continue ;; esac
+              echo "| \`$name\` | $(wc -l < "sources/$name") |"
+            done < sources.tsv
+            echo "| raw merged | $(wc -l < "data/$CATEGORY") |"
+            echo "| **\`$CATEGORY\` in dat** | **$(wc -l < "dist/$CATEGORY.txt")** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit the synced source lists
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sources/
+          git diff --cached --quiet || git commit -m "chore: sync upstream domain lists"
+          git push
+
+      - name: Publish release
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(date -u +'%Y%m%d%H%M')"
+
+          {
+            echo "Category \`geosite:$CATEGORY\` — $(wc -l < "dist/$CATEGORY.txt") domains."
+            echo
+            echo "### Sources"
+            echo
+
+            while IFS=$'\t' read -r name url || [ -n "${name:-}" ]; do
+              [ -z "${name:-}" ] && continue
+              case "$name" in \#*) continue ;; esac
+
+              # derive the repo page from a raw.githubusercontent.com URL
+              repo=$(printf '%s' "$url" \
+                | sed -nE 's#^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/.*#https://github.com/\1/\2#p')
+              if [ -z "$repo" ]; then
+                repo="$url"
+              fi
+
+              echo "- [$repo]($repo) — \`$name\`, $(wc -l < "sources/$name") domains ([raw]($url))"
+            done < sources.tsv
+          } > /tmp/notes.md
+
+          gh release create "$tag" \
+            "dist/$DAT_NAME" \
+            "dist/$DAT_NAME.sha256" \
+            "dist/$CATEGORY.txt" \
+            --title "no-russia $tag" \
+            --notes-file /tmp/notes.md
